@@ -172,6 +172,7 @@ namespace lio
         return cloud_body;
     }
 
+    // 计算点的协方差，存入 pv_list
     void LIOBuilder::process(SyncPackage &package)
     {
         if (status == LIOStatus::IMU_INIT)
@@ -185,7 +186,7 @@ namespace lio
         else if (status == LIOStatus::MAP_INIT)
         {
             undistortCloud(package);
-            pcl::PointCloud<pcl::PointXYZINormal>::Ptr point_world = lidarToWorld(package.cloud);
+            pcl::PointCloud<pcl::PointXYZINormal>::Ptr point_world = lidarToWorld(package.cloud);   // 转换到世界坐标系
             std::vector<PointWithCov> pv_list;
             Eigen::Matrix3d r_wl = kf.x().rot * kf.x().rot_ext;
             Eigen::Vector3d p_wl = kf.x().rot * kf.x().pos_ext + kf.x().pos;
@@ -193,11 +194,12 @@ namespace lio
             {
                 PointWithCov pv;
                 pv.point = Eigen::Vector3d(point_world->points[i].x, point_world->points[i].y, point_world->points[i].z);
-                Eigen::Vector3d point_body(package.cloud->points[i].x, package.cloud->points[i].y, package.cloud->points[i].z);
-                Eigen::Matrix3d point_cov;
+                Eigen::Vector3d point_body(package.cloud->points[i].x, package.cloud->points[i].y, package.cloud->points[i].z); // lidar 坐标系下
+                Eigen::Matrix3d point_cov;  // 点的协方差
                 calcBodyCov(point_body, config.ranging_cov, config.angle_cov, point_cov);
                 Eigen::Matrix3d point_crossmat = Sophus::SO3d::hat(point_body);
 
+                // 计算点的协方差，转换到世界坐标系，并考虑旋转和位置的不确定性
                 point_cov = r_wl * point_cov * r_wl.transpose() +
                             point_crossmat * kf.P().block<3, 3>(kf::IESKF::R_ID, kf::IESKF::R_ID) * point_crossmat.transpose() +
                             kf.P().block<3, 3>(kf::IESKF::P_ID, kf::IESKF::P_ID);

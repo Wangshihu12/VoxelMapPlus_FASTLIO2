@@ -14,27 +14,31 @@ namespace lio
           plane_thresh(_plane_thresh),
           position(_position.x, _position.y, _position.z)
     {
-        merged = false;
-        group_id = VoxelGrid::count++;
-        is_init = false;
-        is_plane = false;
-        temp_points.reserve(max_point_thresh);
+        merged = false;                         // 是否合并
+        group_id = VoxelGrid::count++;          // 网格ID
+        is_init = false;                        // 是否初始化
+        is_plane = false;                       // 是否为平面
+        temp_points.reserve(max_point_thresh);  // 点的缓存
         newly_add_point = 0;
         plane = std::make_shared<Plane>();
-        update_enable = true;
+        update_enable = true;                   // 更新可用
         map = _map;
         // center = Eigen::Vector3d(position.x + 0.5, position.y + 0.5, position.z + 0.5) * map->voxel_size;
     }
 
     void VoxelGrid::addToPlane(const PointWithCov &pv)
     {
+        // 对平面的均值进行增量更新
         plane->mean += (pv.point - plane->mean) / (plane->n + 1.0);
+        // 更新点的乘积和
         plane->ppt += pv.point * pv.point.transpose();
+        // 更新点数
         plane->n += 1;
     }
 
     void VoxelGrid::addPoint(const PointWithCov &pv)
     {
+        // 加入平面和缓存
         addToPlane(pv);
         temp_points.push_back(pv);
     }
@@ -43,12 +47,14 @@ namespace lio
     {
         if (!is_init)
         {
+            // 已经初始化，加入点到平面和缓存，更新平面
             addToPlane(pv);
             temp_points.push_back(pv);
             updatePlane();
         }
         else
         {
+            // 未初始化
             if (is_plane)
             {
                 if (update_enable)
@@ -56,11 +62,13 @@ namespace lio
                     addToPlane(pv);
                     temp_points.push_back(pv);
                     newly_add_point++;
+                    // 更新点达到阈值，更新平面并清零
                     if (newly_add_point >= update_point_thresh)
                     {
                         updatePlane();
                         newly_add_point = 0;
                     }
+                    // 缓存点达到阈值，禁用更新并清空缓存点
                     if (temp_points.size() >= max_point_thresh)
                     {
                         update_enable = false;
@@ -69,11 +77,13 @@ namespace lio
                 }
                 else
                 {
+                    // 如果是平面但无法更新，融合平面
                     merge();
                 }
             }
             else
             {
+                // 如果不是平面但更新可用
                 if (update_enable)
                 {
                     addToPlane(pv);
@@ -100,12 +110,14 @@ namespace lio
         if (plane->n < update_point_thresh)
             return;
         is_init = true;
+        // 计算平面的协方差
         Eigen::Matrix3d cov = plane->ppt / static_cast<double>(plane->n) - plane->mean * plane->mean.transpose();
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
-        Eigen::Matrix3d evecs = es.eigenvectors();
-        Eigen::Vector3d evals = es.eigenvalues();
+        Eigen::Matrix3d evecs = es.eigenvectors();  // 特征向量
+        Eigen::Vector3d evals = es.eigenvalues();   // 特征值
         if (evals(0) > plane_thresh)
         {
+            // 大于阈值，则认为不是平面
             is_plane = false;
             return;
         }
@@ -126,11 +138,13 @@ namespace lio
             }
             J.block<3, 3>(0, 0) = evecs * F;
             J.block<3, 3>(3, 0) = J_Q;
+            // 更新协方差
             plane->cov += J * pv.cov * J.transpose();
         }
         double axis_distance = -plane->mean.dot(plane_norm);
         if (axis_distance < 0.0)
             plane_norm = -plane_norm;
+        // 更新法向量和中心点
         plane->norm = plane_norm;
         center = plane->mean;
     }
@@ -153,11 +167,15 @@ namespace lio
                 std::shared_ptr<VoxelGrid> near_node = it->second;
                 if (near_node->group_id == group_id || near_node->update_enable || !near_node->is_plane)
                     continue;
+                // 计算平面法向量的夹角距离和平面距离
                 double norm_distance = 1.0 - near_node->plane->norm.dot(plane->norm);
                 double axis_distance = std::abs(near_node->plane->norm.dot(near_node->plane->mean) - plane->norm.dot(plane->mean));
-
+                // 如果大于阈值，则不能合并
                 if (norm_distance > merge_thresh_for_angle || axis_distance > merge_thresh_for_distance)
                     continue;
+                // 计算当前体素和相邻体素的平面模型的协方差迹 tn0, tm0, tn1, tm1。
+                // 使用加权平均法计算新的平面均值 new_mean 和法向量 new_norm。
+                // 更新平面模型的协方差 new_cov
                 double tn0 = plane->cov.block<3, 3>(0, 0).trace(),
                        tm0 = plane->cov.block<3, 3>(3, 3).trace(),
                        tn1 = near_node->plane->cov.block<3, 3>(0, 0).trace(),
@@ -167,8 +185,8 @@ namespace lio
                 Eigen::Vector3d new_norm = tn0 * near_node->plane->norm + tn1 * plane->norm / (tn0 + tn1);
                 Eigen::Matrix<double, 6, 6> new_cov = (tc0 * tc0 * near_node->plane->cov + tc1 * tc1 * plane->cov) / ((tc0 + tc1) * (tc0 + tc1));
 
-                near_node->group_id = group_id;
-                merged = true;
+                near_node->group_id = group_id;     // 把当前平面的 id 赋值给合并后的平面
+                merged = true;  // 表示已经合并过
                 near_node->merged = true;
 
                 if (-new_mean.dot(new_norm) < 0.0)
@@ -191,6 +209,7 @@ namespace lio
         cache.clear();
     }
 
+    // 将三维坐标转换为体素网格的索引
     VoxelKey VoxelMap::index(const Eigen::Vector3d &point)
     {
         Eigen::Vector3d idx = (point / voxel_size).array().floor();
@@ -199,12 +218,15 @@ namespace lio
 
     void VoxelMap::build(std::vector<PointWithCov> &pvs)
     {
+        // 遍历点云
         for (PointWithCov &pv : pvs)
         {
+            // 计算体素位置
             VoxelKey k = index(pv.point);
             auto it = featmap.find(k);
             if (it == featmap.end())
             {
+                // 如果不存在,创建一个新的体素
                 featmap[k] = std::make_shared<VoxelGrid>(max_point_thresh, update_point_thresh, plane_thresh, k, this);
                 cache.push_front(k);
                 featmap[k]->cache_it = cache.begin();
@@ -217,14 +239,16 @@ namespace lio
             }
             else
             {
+                // 如果体素存在,将该体素移动到 cache 的前端，表示最近使用的
                 cache.splice(cache.begin(), cache, featmap[k]->cache_it);
             }
-
+            // 加入该体素的平面
             featmap[k]->addPoint(pv);
         }
 
         for (auto it = featmap.begin(); it != featmap.end(); it++)
         {
+            // 遍历 featmap 更新平面
             it->second->updatePlane();
         }
     }

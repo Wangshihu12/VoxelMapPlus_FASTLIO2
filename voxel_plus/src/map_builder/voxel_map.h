@@ -24,6 +24,7 @@ namespace lio
         {
             return (x == other.x && y == other.y && z == other.z);
         }
+        // 为 VoxelKey 类型的对象生成哈希值
         struct Hasher
         {
             int64_t operator()(const VoxelKey &k) const
@@ -36,18 +37,18 @@ namespace lio
     struct PointWithCov
     {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        Eigen::Vector3d point;
-        Eigen::Matrix3d cov;
+        Eigen::Vector3d point;  // 世界坐标系下
+        Eigen::Matrix3d cov;    // 世界坐标系下
     };
 
     struct Plane
     {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-        Eigen::Matrix3d ppt = Eigen::Matrix3d::Zero();
-        Eigen::Vector3d norm = Eigen::Vector3d::Zero();
-        Eigen::Matrix<double, 6, 6> cov;
-        int n = 0;
+        Eigen::Vector3d mean = Eigen::Vector3d::Zero(); // 平面的均值
+        Eigen::Matrix3d ppt = Eigen::Matrix3d::Zero();  // 点的乘积
+        Eigen::Vector3d norm = Eigen::Vector3d::Zero(); // 法向量
+        Eigen::Matrix<double, 6, 6> cov;    // 协方差
+        int n = 0;  // 平面中的点数
     };
 
     struct ResidualData
@@ -86,18 +87,18 @@ namespace lio
         int max_point_thresh;
         int update_point_thresh;
         double plane_thresh;
-        bool is_init;
-        bool is_plane;
-        bool update_enable;
-        int newly_add_point;
-        bool merged;
-        uint64_t group_id;
-        std::vector<PointWithCov> temp_points;
-        VoxelKey position;
+        bool is_init;               // 是否初始化
+        bool is_plane;              // 是否是平面
+        bool update_enable;         // 能否更新
+        int newly_add_point;        // 新加入的点
+        bool merged;                // 是否被融合
+        uint64_t group_id;          // 网格ID
+        std::vector<PointWithCov> temp_points;  // 缓存的点
+        VoxelKey position;  // 键
         VoxelMap *map;
         std::shared_ptr<Plane> plane;
         Eigen::Vector3d center;
-        std::list<VoxelKey>::iterator cache_it;
+        std::list<VoxelKey>::iterator cache_it;     // 最近更新点云的迭代器
         static double merge_thresh_for_angle;
         static double merge_thresh_for_distance;
     };
@@ -118,13 +119,13 @@ namespace lio
         bool buildResidual(ResidualData &data, std::shared_ptr<VoxelGrid> voxel_grid);
 
     public:
-        int max_point_thresh;
-        int update_point_thresh;
-        double plane_thresh;
+        int max_point_thresh;       // 一个网格包含的最大点阈值
+        int update_point_thresh;    // 更新点阈值，超过这个值就更新网格内的平面
+        double plane_thresh;        // 平面阈值，是否是平面
         double voxel_size;
         Featmap featmap;
         std::list<VoxelKey> cache;
-        int capacity;
+        int capacity;               // 网格容量
     };
 
 } // namespace lio
