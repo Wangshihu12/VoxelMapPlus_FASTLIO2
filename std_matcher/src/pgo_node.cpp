@@ -247,15 +247,25 @@ public:
         data_group.time_buffer.push(msg->header.stamp.toSec());
     }
 
+    /**
+     * [功能描述]：位姿图优化（PGO）主循环回调函数，负责处理点云数据、构建因子图、
+     *            执行回环检测、进行增量式位姿图优化，并发布优化后的结果。
+     * @param e：ROS定时器事件对象，包含定时触发的相关信息。
+     */
     void mainLoopCB(const ros::TimerEvent &e)
     {
+        // ==================== 第一部分：从缓冲区获取数据 ====================
         {
+            // 使用互斥锁保护缓冲区的线程安全访问
             std::lock_guard<std::mutex> lock(data_group.buffer_mutex);
+            // 如果点云缓冲区为空，直接返回
             if (data_group.cloud_buffer.size() < 1)
                 return;
+            // 获取缓冲区队首的点云、位姿和时间戳数据
             data_group.current_cloud = data_group.cloud_buffer.front();
             data_group.current_pose = data_group.pose_buffer.front();
             data_group.current_time = data_group.time_buffer.front();
+            // 清空所有缓冲区，只保留最新数据（丢弃中间帧以保持实时性）
             while (!data_group.cloud_buffer.empty())
             {
                 data_group.cloud_buffer.pop();
@@ -263,33 +273,51 @@ public:
                 data_group.time_buffer.pop();
             }
         }
+
+        // ==================== 第二部分：点云预处理 ====================
+        // 将点云从局部坐标系变换到世界坐标系
         pcl::transformPointCloud(*data_group.current_cloud, *data_group.current_cloud, data_group.current_pose);
 
+        // 对点云进行体素滤波下采样，减少点数以提高后续处理效率
         std_desc::voxelFilter(data_group.current_cloud, node_config.ds_size);
 
+        // 初始化关键帧点云容器（如果为空）
         if (data_group.key_cloud == nullptr)
             data_group.key_cloud.reset(new pcl::PointCloud<pcl::PointXYZI>);
+        // 将当前帧点云累加到关键帧点云中（用于后续STD特征提取）
         *data_group.key_cloud += *data_group.current_cloud;
 
+        // ==================== 第三部分：构建因子图 ====================
+        // 获取当前帧的位姿变换矩阵
         Eigen::Affine3d pose = data_group.current_pose;
         // pose.linear() = data_group.current_pose.first;
         // pose.translation() = data_group.current_pose.second;
+
+        // 将当前位姿作为初始值插入到iSAM2的初始估计中
         data_group.initial.insert(data_group.cloud_idx, gtsam::Pose3(pose.matrix()));
+
         if (!data_group.cloud_idx)
         {
+            // 对于第一帧，添加先验因子作为全局锚点，固定起始位姿
             data_group.graph.add(gtsam::PriorFactor<gtsam::Pose3>(0, gtsam::Pose3(pose.matrix()), data_group.odometryNoise));
         }
         else
         {
+            // 对于后续帧，添加里程计因子（相邻帧之间的相对位姿约束）
             auto prev_pose = gtsam::Pose3(data_group.origin_pose_vec[data_group.cloud_idx - 1].matrix());
             auto curr_pose = gtsam::Pose3(pose.matrix());
+            // 计算前后帧之间的相对变换，并添加为BetweenFactor
             data_group.graph.add(gtsam::BetweenFactor<gtsam::Pose3>(data_group.cloud_idx - 1, data_group.cloud_idx,
                                                                     prev_pose.between(curr_pose), data_group.odometryNoise));
         }
 
+        // 保存原始位姿（用于后续回环检测时计算相对变换）
         data_group.origin_pose_vec.push_back(pose);
+        // 保存优化后的位姿（初始时与原始位姿相同）
         data_group.pose_vec.push_back(pose);
 
+        // ==================== 第四部分：回环检测与约束添加 ====================
+        // 每隔sub_frame_num帧进行一次回环检测（跳过第0帧）
         if (data_group.cloud_idx % node_config.sub_frame_num == 0 && data_group.cloud_idx != 0)
         {
             // if (data_group.cloud_idx == 660)
@@ -297,55 +325,78 @@ public:
             //     pcl::PCDWriter writer;
             //     writer.write("/home/zhouzhou/temp/660_new.pcd", *data_group.key_cloud);
             // }
+
+            // 从累积的关键帧点云中提取STD（Scan-To-Descriptor）特征
             std_desc::STDFeature feature = std_manager->extract(data_group.key_cloud);
             ROS_INFO("ID: %lu  FEATRUE SIZE: %lu CLOUD SIZE: %lu", data_group.cloud_idx, feature.descs.size(), data_group.key_cloud->size());
             std_desc::LoopResult result;
 
             int64_t duration;
+            // 只有当帧索引超过skip_near_num时才进行回环搜索（避免与临近帧误匹配）
             if (data_group.cloud_idx > std_config.skip_near_num)
             {
+                // 记录回环搜索的耗时
                 auto start = std::chrono::high_resolution_clock::now();
+                // 在历史特征库中搜索回环候选
                 result = std_manager->searchLoop(feature);
                 auto end = std::chrono::high_resolution_clock::now();
                 duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
             }
 
+            // 将当前特征插入到特征管理器中，用于后续帧的回环检测
             std_manager->insert(feature);
+
+            // 如果检测到有效的回环
             if (result.valid)
             {
-
                 // 这里得到是新旧世界坐标系下的差值 T_old_new;
                 ROS_WARN("FIND MATCHED LOOP! CURRENT_ID: %lu, LOOP_ID: %lu MATCH SCORE: %.4f, TIME COST: %lu ms", feature.id, result.match_id, result.match_score, duration);
+
+                // 使用几何平面ICP验证回环结果并精化位姿变换
                 double score = std_manager->verifyGeoPlaneICP(feature.cloud, std_manager->cloud_vec[result.match_id], result.rotation, result.translation);
+
+                // 标记检测到回环
                 data_group.has_loop_flag = true;
+                // 保存回环约束对（历史帧ID, 当前帧ID）
                 data_group.loop_container.emplace_back(result.match_id, feature.id);
-                // 10 20
+
+                // 为子帧添加回环约束（关键帧由多个子帧组成）
+                // 例如：sub_frame_num=10时，关键帧包含10个子帧
                 for (size_t j = 1; j <= node_config.sub_frame_num; j++)
                 {
-                    // 当前帧
+                    // 计算当前关键帧中的子帧索引
                     int src_frame = data_group.cloud_idx + j - node_config.sub_frame_num;
-                    // 历史帧
+                    // 计算历史匹配关键帧中对应的子帧索引
                     int tar_frame = result.match_id * node_config.sub_frame_num + j;
 
+                    // 构造回环检测得到的位姿变换矩阵（从当前帧到历史帧的变换）
                     Eigen::Affine3d delta_pose = Eigen::Affine3d::Identity();
-                    delta_pose.linear() = result.rotation;
-                    delta_pose.translation() = result.translation;
+                    delta_pose.linear() = result.rotation;          // 旋转部分
+                    delta_pose.translation() = result.translation;  // 平移部分
 
+                    // 使用回环变换矫正当前子帧的位姿
                     Eigen::Affine3d refined_src = delta_pose * data_group.origin_pose_vec[src_frame];
+                    // 获取历史目标子帧的位姿
                     Eigen::Affine3d tar_pose = data_group.origin_pose_vec[tar_frame];
 
+                    // 添加回环因子（带有鲁棒噪声模型以抑制错误回环的影响）
                     data_group.graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
                         tar_frame, src_frame,
                         gtsam::Pose3(tar_pose.matrix()).between(gtsam::Pose3(refined_src.matrix())),
                         data_group.robustLoopNoise));
                 }
             }
+            // 清空关键帧点云，准备下一个关键帧的累积
             data_group.key_cloud->clear();
         }
 
+        // ==================== 第五部分：增量式位姿图优化 ====================
+        // 使用iSAM2进行增量式优化，传入新增的因子和初始值
         data_group.isam->update(data_group.graph, data_group.initial);
+        // 额外进行一次更新以提高收敛性
         data_group.isam->update();
 
+        // 如果检测到回环，多次更新iSAM2以确保回环约束充分收敛
         if (data_group.has_loop_flag)
         {
             data_group.isam->update();
@@ -355,13 +406,18 @@ public:
             data_group.isam->update();
         }
 
+        // 清空因子图和初始值容器，为下一次迭代准备
         data_group.graph.resize(0);
         data_group.initial.clear();
 
+        // ==================== 第六部分：获取优化结果并更新位姿 ====================
+        // 从iSAM2获取当前所有节点的优化估计值
         gtsam::Values curr_estimates = data_group.isam->calculateEstimate();
 
+        // 确保优化结果数量与位姿向量长度一致
         assert(curr_estimates.size() == data_group.pose_vec.size());
 
+        // 将优化后的位姿更新到pose_vec中
         for (int i = 0; i < curr_estimates.size(); i++)
         {
             gtsam::Pose3 est = curr_estimates.at<gtsam::Pose3>(i);
@@ -369,20 +425,30 @@ public:
             data_group.pose_vec[i] = est_affine3d;
         }
 
+        // ==================== 第七部分：发布结果 ====================
+        // 获取最后一帧的优化位姿
         Eigen::Affine3d last_pose = data_group.pose_vec.back();
 
+        // 计算优化后位姿与原始位姿之间的差异变换（用于TF广播）
+        // frame_delta_pose = T_optimized * T_original^(-1)
         Eigen::Affine3d frame_delta_pose = last_pose * data_group.origin_pose_vec.back().inverse();
 
+        // 广播TF变换，将局部坐标系与地图坐标系连接起来
         br.sendTransform(eigen2Transform(frame_delta_pose.linear(), frame_delta_pose.translation(), node_config.map_frame, node_config.local_frame, data_group.current_time));
 
+        // 发布原始里程计路径（未优化）
         publishPath(path_pub, data_group.origin_pose_vec);
 
+        // 发布优化后的路径
         publishPath(correct_path_pub, data_group.pose_vec);
 
+        // 发布回环约束可视化标记
         publishLoopConstraints();
 
+        // 帧索引递增
         data_group.cloud_idx++;
 
+        // 重置回环标志位
         data_group.has_loop_flag = false;
     }
 
